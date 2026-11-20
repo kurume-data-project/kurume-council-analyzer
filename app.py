@@ -101,7 +101,6 @@ def split_question_items(cell):
     fragment = BeautifulSoup(str(cell), "html.parser")
     for br in fragment.find_all("br"):
         _ = br.replace_with("\n")
-
     for tag in fragment.find_all(["p", "div", "li"]):
         _ = tag.insert_before("\n")
         _ = tag.insert_after("\n")
