@@ -100,10 +100,11 @@ def split_question_items(cell):
     """親質問を抽出する。小項目は分割せず、別テーマの「について」は区切る。"""
     fragment = BeautifulSoup(str(cell), "html.parser")
     for br in fragment.find_all("br"):
-        br.replace_with("\n")
-    for tag in fragment.find_all(["p", "div", "li"]):
-        tag.insert_before("\n")
-        tag.insert_after("\n")
+    _ = br.replace_with("\n")
+
+for tag in fragment.find_all(["p", "div", "li"]):
+    _ = tag.insert_before("\n")
+    _ = tag.insert_after("\n")
 
     raw = unicodedata.normalize("NFKC", fragment.get_text("", strip=False))
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
