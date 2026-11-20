@@ -94,9 +94,6 @@ def discover_general_pages(start_year=START_YEAR):
 
     return sorted(found, key=lambda item: (item["年度"], item["会議"]))
 
-
-
-
 def split_question_items(cell):
     """親質問（1.、2.）ごとに分割し、小項目は親質問内に保持する。"""
 
