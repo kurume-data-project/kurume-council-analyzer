@@ -96,53 +96,67 @@ def discover_general_pages(start_year=START_YEAR):
 
 
 
+
 def split_question_items(cell):
-    """親質問だけを分割し、ア・イ等の小項目は親質問の本文に残す。"""
-    # HTMLのbr・段落境界だけを改行として扱い、span等のインライン要素では
-    # 不必要に文章を分断しない。
+    """親質問（1.、2.）ごとに分割し、小項目は親質問内に保持する。"""
+
     fragment = BeautifulSoup(str(cell), "html.parser")
+
+    # HTMLの改行・段落境界を明示的な改行にする
     for br in fragment.find_all("br"):
         br.replace_with("\n")
+
     for tag in fragment.find_all(["p", "div", "li"]):
         tag.insert_before("\n")
         tag.insert_after("\n")
 
     raw = fragment.get_text("", strip=False)
-    raw = unicodedata.normalize("NFKC", raw).replace("\r", "\n")
-    lines = [re.sub(r"[ \t　]+", " ", x).strip()
-             for x in raw.split("\n") if x.strip()]
+    raw = unicodedata.normalize("NFKC", raw)
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = re.sub(r"[ \t　]+", " ", raw)
 
-    # 「1.」「1．」「1、」等の親項目番号のみで分割。
-    # 「ア.」「イ.」「(1)」などの小項目は分割せず親質問に連結する。
-    main_re = re.compile(r"^([0-9]{1,2})\s*[.．、]\s*(.*)$")
+    # 親質問番号の直前で分割する。
+    # (1)、ア、イなどの小項目番号では分割しない。
+    parts = re.split(
+        r"(?<!\S)(?=[0-9]{1,2}\s*[.．、]\s*)",
+        raw
+    )
+
     records = []
-    current = None
-    for line in lines:
-        match = main_re.match(line)
-        if match:
-            if current is not None:
-                records.append(current)
-            current = {
-                "質問番号": match.group(1),
-                "質問項目": match.group(2).strip(),
-                "質問詳細": "",
-                "親質問番号": "",
-                "親質問項目": "",
-                "小項目番号": "",
-                "分割階層": "親質問",
-            }
-        elif current is None:
-            current = {
-                "質問番号": "", "質問項目": line, "質問詳細": "",
-                "親質問番号": "", "親質問項目": "", "小項目番号": "",
-                "分割階層": "親質問",
-            }
-        else:
-            # 小項目・説明行はすべて直前の親質問に保持する。
-            current["質問項目"] = (current["質問項目"] + " " + line).strip()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
 
-    if current is not None:
-        records.append(current)
+        match = re.match(
+            r"^([0-9]{1,2})\s*[.．、]\s*(.*)$",
+            part,
+            flags=re.S
+        )
+
+        if match:
+            number = match.group(1)
+            question = match.group(2).strip()
+        else:
+            number = ""
+            question = part
+
+        # 空行や余分な空白を整理
+        question = re.sub(r"\s+", " ", question).strip()
+
+        if not question:
+            continue
+
+        records.append({
+            "質問番号": number,
+            "質問項目": question,
+            "質問詳細": "",
+            "親質問番号": "",
+            "親質問項目": "",
+            "小項目番号": "",
+            "分割階層": "親質問",
+        })
+
     return records
 
 def parse_question_page(page_url, year, meeting_title):
