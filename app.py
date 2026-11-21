@@ -362,39 +362,199 @@ def extract_docx_text(uploaded_file):
 
 
 def split_minutes_speakers(text):
-    """Split DOCX text into speaker turns using common Japanese minutes labels.
+    """Split minutes into speaker turns. Handles common plain-text DOCX layouts.
 
-    This is a review aid, not a guaranteed question/answer semantic parser.
+    A turn boundary is detected only when a line looks like a speaker label;
+    otherwise the line is appended to the current speaker's utterance.
     """
-    speaker_re = re.compile(
-        r"^(?P<speaker>[^：:]{1,45}?(?:議員|君|市長|副市長|教育長|部長|局長|課長|委員長|事務局長))\s*[：:]\s*(?P<body>.*)$"
-    )
+    speaker_patterns = [
+        # ○○議員： / ○○部長： / 市長：
+        re.compile(r"^(?P<speaker>(?:[○●◎◇◆□■]?[0-9０-９]+番\s*)?[^：:]{1,55}?(?:議員|君|市長|副市長|教育長|部長|局長|課長|室長|次長|参事|委員長|事務局長))\s*[：:]\s*(?P<body>.*)$"),
+        # ○○（議員） or ○○（○○部長） as standalone heading
+        re.compile(r"^(?P<speaker>[^：:（）()]{1,40}[（(](?:議員|市長|副市長|教育長|[^）)]{1,20}(?:部長|局長|課長|室長|次長))[）)])\s*$"),
+        # ○○議員 / ○○部長 as standalone heading
+        re.compile(r"^(?P<speaker>(?:[○●◎◇◆□■]?[0-9０-９]+番\s*)?[^：:]{1,45}?(?:議員|君|市長|副市長|教育長|部長|局長|課長|室長|次長|参事|委員長|事務局長))\s*$"),
+    ]
     turns = []
     current_speaker = ""
     current_lines = []
 
-    def flush():
-        if current_lines:
-            body = "\n".join(current_lines).strip()
-            if body:
-                role = "答弁側候補" if re.search(r"市長|副市長|教育長|部長|局長|課長|事務局長", current_speaker) else "質問・発言側候補"
-                turns.append({"発言者": current_speaker or "発言者未判定", "区分（推定）": role, "発言内容": body})
+    def role_for(speaker):
+        label = clean_text(speaker)
+        if is_council_member_speaker(label):
+            return "質問・議員発言候補"
+        if re.search(r"市長|副市長|教育長|部長|局長|課長|室長|次長|参事|事務局長", label):
+            return "答弁側候補"
+        return "未判定"
 
-    for line in text.splitlines():
-        line = clean_text(line)
+    def flush():
+        body = "\n".join(current_lines).strip()
+        if body:
+            turns.append({
+                "発言者": current_speaker or "発言者未判定",
+                "区分（推定）": role_for(current_speaker),
+                "発言内容": body,
+            })
+
+    for raw_line in text.splitlines():
+        line = clean_text(raw_line)
         if not line:
             continue
-        match = speaker_re.match(line)
-        if match:
+        found = None
+        for pattern in speaker_patterns:
+            found = pattern.match(line)
+            if found:
+                break
+        if found:
             flush()
-            current_speaker = clean_text(match.group("speaker"))
-            current_lines = [clean_text(match.group("body"))] if clean_text(match.group("body")) else []
-        elif current_lines:
+            current_speaker = clean_text(found.group("speaker"))
+            body = clean_text(found.groupdict().get("body") or "")
+            current_lines = [body] if body else []
+        elif current_lines or current_speaker:
             current_lines.append(line)
         else:
-            current_lines = [line]
+            # Front matter (meeting title, date, page header) is not treated as speech.
+            continue
     flush()
     return turns
+
+
+def department_profile_from_speaker(speaker):
+    """Return department/section evidence from a minutes speaker label.
+
+    Exact section names are preferred. Parent department labels are retained as
+    parent-level evidence; they are not silently converted to a specific section.
+    """
+    label = clean_text(speaker)
+    if not label:
+        return "", ""
+
+    # Explicit section names in the speaker label.
+    section_names = [
+        section for sections in DUTY_RULES.values() for section in sections
+        if section and section in label
+    ]
+    if section_names:
+        section = max(section_names, key=len)
+        section_theme = next(
+            (theme for theme, sections in DUTY_RULES.items() if section in sections),
+            "",
+        )
+        return section, section_theme, "発言者表記に課名あり"
+
+    parent_map = {
+        "教育委員会": ("教育委員会", "子育て・教育"),
+        "教育部": ("教育部", "子育て・教育"),
+        "子ども未来部": ("子ども未来部", "子育て・教育"),
+        "こども未来部": ("こども未来部", "子育て・教育"),
+        "健康福祉部": ("健康福祉部", "高齢・介護・福祉"),
+        "福祉部": ("福祉部", "高齢・介護・福祉"),
+        "環境部": ("環境部", "環境・上下水道"),
+        "環境保全部": ("環境保全部", "環境・上下水道"),
+        "都市建設部": ("都市建設部", "道路・交通・都市整備"),
+        "都市整備部": ("都市整備部", "道路・交通・都市整備"),
+        "上下水道部": ("上下水道部", "環境・上下水道"),
+        "農政部": ("農政部", "産業・農業・観光"),
+        "商工観光労働部": ("商工観光労働部", "産業・農業・観光"),
+        "商工観光部": ("商工観光部", "産業・農業・観光"),
+        "総務部": ("総務部", "行政運営・DX・財政"),
+        "総合政策部": ("総合政策部", "行政運営・DX・財政"),
+        "市民文化部": ("市民文化部", "文化・市民協働"),
+        "協働推進部": ("協働推進部", "文化・市民協働"),
+        "防災対策担当": ("防災対策担当", "防災・危機管理"),
+    }
+    for parent, result in parent_map.items():
+        if parent in label:
+            return result[0], result[1], "発言者表記に部局名あり（課までは特定できず）"
+    return "", "", "発言者表記から部署を特定できず"
+
+
+def infer_department_from_speaker(speaker):
+    return department_profile_from_speaker(speaker)[0]
+
+
+def is_council_member_speaker(speaker):
+    label = clean_text(speaker)
+    return bool(re.search(r"議員|君", label)) and not bool(
+        re.search(r"委員会事務局|教育委員会", label)
+    )
+
+
+def pair_question_and_answers(turns, filename=""):
+    """Create candidate pairs: member turn followed by executive turns.
+
+    Pairing is scoped to the same imported minutes document and follows the
+    speaker order. The UI labels these as candidates because some formats split
+    one question/answer across multiple speakers or sections.
+    """
+    pairs = []
+    current_question = None
+    answer_parts = []
+
+    def flush_pair():
+        if current_question is None:
+            return
+        answer_text = "\n\n".join(
+            part["発言内容"] for part in answer_parts if part.get("発言内容")
+        )
+        answer_speakers = list(dict.fromkeys(
+            part["発言者"] for part in answer_parts if part.get("発言内容")
+        ))
+        profiles = [department_profile_from_speaker(name) for name in answer_speakers]
+        departments = list(dict.fromkeys(name for name, _, _ in profiles if name))
+        dept_themes = [theme for _, theme, _ in profiles if theme]
+        department_evidence = list(dict.fromkeys(reason for name, _, reason in profiles if name))
+        department = "・".join(departments)
+
+        # When an exact section or parent department is identified, use its
+        # official-duty theme as the primary classification.
+        if dept_themes:
+            unique_themes = list(dict.fromkeys(dept_themes))
+            if len(unique_themes) == 1:
+                theme = unique_themes[0]
+                evidence = "答弁者の所属表記: " + department
+            else:
+                theme = "その他・要確認"
+                evidence = "答弁者の所属分野が複数: " + " / ".join(unique_themes)
+            _, keyword_evidence, question_dept = classify_theme(current_question.get("発言内容", ""))
+        else:
+            theme, keyword_evidence, question_dept = classify_theme(current_question.get("発言内容", ""))
+            evidence = "答弁部署を特定できず。質問文による参考分類: " + keyword_evidence
+
+        if not answer_text:
+            status = "答弁候補なし"
+            confidence = "低"
+        elif departments and len(set(dept_themes)) == 1:
+            status = "発言順・答弁者所属からの対応候補"
+            confidence = "中"
+        else:
+            status = "発言順による対応候補（部署未確定）"
+            confidence = "低"
+
+        pairs.append({
+            "ファイル名": filename,
+            "質問者": current_question.get("発言者", ""),
+            "質問内容": current_question.get("発言内容", ""),
+            "答弁者": "・".join(answer_speakers),
+            "答弁担当部署": department or "判定できず",
+            "部署判定根拠": "／".join(department_evidence) if department_evidence else "部署名を発言者表記から確認できず",
+            "答弁内容": answer_text,
+            "テーマ（答弁者部署を優先）": theme,
+            "分類根拠": evidence,
+            "対応付け信頼度（参考）": confidence,
+            "対応付け状況": status,
+        })
+
+    for turn in turns:
+        speaker = turn.get("発言者", "")
+        if is_council_member_speaker(speaker):
+            flush_pair()
+            current_question = turn
+            answer_parts = []
+        elif current_question is not None and turn.get("区分（推定）") == "答弁側候補":
+            answer_parts.append(turn)
+    flush_pair()
+    return pairs
 
 def fetch_newsletter_links():
     soup = get_soup(NEWS_INDEX)
@@ -437,7 +597,7 @@ DUTY_RULES = {
         "家庭子ども相談課": ["家庭児童相談", "ひとり親", "児童手当", "児童扶養手当", "母子生活支援"],
         "こども子育てサポートセンター": ["母子保健", "妊産婦", "乳幼児", "子育て相談", "児童センター"],
         "青少年育成課": ["青少年", "若者相談", "非行", "薬物乱用"],
-        "学校教育課": ["学校教育", "学習指導", "教職員", "不登校", "いじめ", "特別支援教育", "学校給食"],
+        "学校教育課": ["学校教育", "学習指導", "教職員", "不登校", "いじめ", "特別支援教育", "学校給食", "授業", "学級", "教科", "教育課程"],
         "学校施設課": ["学校施設", "校舎", "体育館", "通学路"],
     },
     "高齢・介護・福祉": {
@@ -465,7 +625,7 @@ DUTY_RULES = {
         "市営住宅課": ["市営住宅", "市営団地", "市営住宅家賃"],
         "公園緑化推進課": ["公園", "緑地", "緑化", "街路樹"],
         "路政課": ["道路占用", "道路境界", "道路台帳", "私道"],
-        "道路整備課": ["道路整備", "道路改良", "橋りょう", "橋梁", "歩道", "街路事業"],
+        "道路整備課": ["道路整備", "道路改良", "橋りょう", "橋梁", "歩道", "街路事業", "舗装", "舗装補修", "路面", "道路補修"],
         "河川課": ["河川", "水路", "排水", "浸水被害", "治水"],
         "建築指導課": ["建築基準", "建築確認", "耐震", "既存建築物", "建築物防災"],
     },
@@ -1026,6 +1186,7 @@ else:
         )
         if uploaded_minutes:
             extracted_records = []
+            paired_records = []
             for file in uploaded_minutes:
                 try:
                     full_text = extract_docx_text(file)
@@ -1036,29 +1197,57 @@ else:
                         extracted_records.append({
                             "ファイル名": file.name, "発言順": turn_no,
                             "発言者": turn["発言者"], "区分（推定）": turn["区分（推定）"],
+                            "答弁担当部署（発言者表記から推定）": infer_department_from_speaker(turn["発言者"]),
                             "発言内容": turn["発言内容"],
                         })
+                    paired_records.extend(pair_question_and_answers(turns, file.name))
                 except Exception as exc:
                     st.error(f"{file.name} を読み込めませんでした：{type(exc).__name__}: {exc}")
             if extracted_records:
                 minutes_df = pd.DataFrame(extracted_records)
                 st.success(f"{len(uploaded_minutes)}ファイルから {len(minutes_df)} 発言ブロックを抽出しました。")
-                st.warning(
-                    "発言者・答弁側の判定は見出し表記に基づく暫定判定です。質問と答弁の対応関係を"
-                    "自動確定したものではありません。会議名・発言者・発言順を確認してください。"
-                )
-                speaker_filter = st.selectbox(
-                    "表示する区分", ["すべて", "質問・発言側候補", "答弁側候補", "未判定"],
-                    key="minutes_speaker_filter",
-                )
-                view_df = minutes_df if speaker_filter == "すべて" else minutes_df[minutes_df["区分（推定）"] == speaker_filter]
-                st.dataframe(view_df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "抽出した発言一覧をCSVで保存",
-                    data=minutes_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="kurume_minutes_speeches.csv",
-                    mime="text/csv", use_container_width=True,
-                )
+                st.subheader("質問と答弁の対応候補")
+                if paired_records:
+                    paired_df = pd.DataFrame(paired_records)
+                    st.info(
+                        "議員の発言の後に続く答弁側発言を、発言順で対応付けています。"
+                        "答弁者の役職・部署名から担当部署を推定し、その部署を優先してテーマを判定します。"
+                    )
+                    st.dataframe(
+                        paired_df[["ファイル名", "質問者", "質問内容", "答弁者", "答弁担当部署", "テーマ（答弁者部署を優先）", "対応付け信頼度（参考）", "対応付け状況"]],
+                        use_container_width=True, hide_index=True,
+                    )
+                    with st.expander("答弁本文・分類根拠を確認"):
+                        for idx, row in paired_df.iterrows():
+                            st.markdown(f"**{idx + 1}. {row['質問者']}／{row['テーマ（答弁者部署を優先）']}**")
+                            st.write("質問：", row["質問内容"])
+                            st.write("答弁者：", row["答弁者"] or "未検出")
+                            st.write("担当部署：", row["答弁担当部署"])
+                            st.write("答弁：", row["答弁内容"] or "答弁候補を検出できませんでした")
+                            st.caption("部署判定根拠：" + row["部署判定根拠"] + " ／ 分類根拠：" + row["分類根拠"] + " ／ 対応付け：" + row["対応付け状況"])
+                    st.download_button(
+                        "質問・答弁の対応候補をCSV保存",
+                        data=paired_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="kurume_question_answer_pairs.csv",
+                        mime="text/csv", use_container_width=True,
+                    )
+                    st.session_state["minutes_question_answer_pairs"] = paired_df
+                else:
+                    st.warning("質問者・答弁者の発言区分を判定できませんでした。Wordの発言者表記を確認してください。")
+
+                with st.expander("発言ブロック一覧（確認用）"):
+                    speaker_filter = st.selectbox(
+                        "表示する区分", ["すべて", "質問・発言側候補", "答弁側候補", "未判定"],
+                        key="minutes_speaker_filter",
+                    )
+                    view_df = minutes_df if speaker_filter == "すべて" else minutes_df[minutes_df["区分（推定）"] == speaker_filter]
+                    st.dataframe(view_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "抽出した発言一覧をCSVで保存",
+                        data=minutes_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name="kurume_minutes_speeches.csv",
+                        mime="text/csv", use_container_width=True,
+                    )
                 st.session_state["minutes_imported_records"] = minutes_df
 
 st.divider()
