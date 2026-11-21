@@ -28,7 +28,9 @@ MEMBER_LIST_URL = (
     "https://www.city.kurume.fukuoka.jp/1100keikaku/2040shigikai/"
     "3020meibo/2019-0509-1504-175t1.html"
 )
-START_YEAR = 2018
+TERM_START_YEAR = 2023
+TERM_START_SESSION = 2  # 令和5年第2回定例会以降を現任期として扱う
+TERM_END_YEAR = 2027
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; KurumeCouncilResearch/2.0; "
@@ -72,7 +74,7 @@ def get_soup(url):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def discover_general_pages(start_year=START_YEAR):
+def discover_general_pages(start_year=TERM_START_YEAR):
     soup = get_soup(GENERAL_INDEX)
     found = []
     seen = set()
@@ -81,8 +83,23 @@ def discover_general_pages(start_year=START_YEAR):
         title = clean_text(anchor.get_text(" ", strip=True))
         url = urljoin(GENERAL_INDEX, anchor["href"])
         year = era_to_year(title)
-        if (
+        # 現任期は2023年5月2日開始。2023年分は第2回定例会以降に限定。
+        session_match = re.search(r"第\s*([0-9０-９]+)\s*回", title)
+        session_number = (
+            int(unicodedata.normalize("NFKC", session_match.group(1)))
+            if session_match else None
+        )
+        in_current_term = (
             year is not None
+            and (year > TERM_START_YEAR or (
+                year == TERM_START_YEAR
+                and session_number is not None
+                and session_number >= TERM_START_SESSION
+            ))
+            and year <= TERM_END_YEAR
+        )
+        if (
+            in_current_term
             and year >= int(start_year)
             and "一般質問表" in title
             and url not in seen
@@ -270,7 +287,7 @@ def parse_question_page(page_url, year, meeting_title):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_general_questions(start_year=START_YEAR):
+def fetch_general_questions(start_year=TERM_START_YEAR):
     pages = discover_general_pages(start_year)
     all_rows = []
     errors = []
@@ -411,7 +428,7 @@ def text_clarity_indicators(text):
 
 st.title("🏛️ 久留米市議会・議員活動分析")
 st.caption(
-    "2018年以降の一般質問を久留米市公式公開資料から取得し、"
+    "現任期中の一般質問を久留米市公式公開資料から取得し、"
     "質問テーマ・会議録確認状況・市民への影響・公式発信を整理する調査支援ツール"
 )
 st.info(
@@ -422,16 +439,14 @@ st.info(
 
 with st.sidebar:
     st.header("データ取得")
-    years = list(range(2018, datetime.now().year + 1))
-    start_year = st.selectbox(
-        "分析開始年", years, index=0
-    )
+    start_year = TERM_START_YEAR
+    st.info("分析対象：現任期（2023年5月2日以降）")
     if st.button("公式資料を再取得", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
     st.caption("取得元：久留米市公式サイト")
     st.caption("分析対象：公式名簿に掲載された現職議員のみ")
-    st.caption("現職議員の2018年以降の質問履歴を集計します。")
+    st.caption("現任期中の一般質問のみを集計します。")
     st.caption("現職名簿：" + MEMBER_LIST_URL)
 
 try:
@@ -489,7 +504,7 @@ else:
         col1, col2, col3 = st.columns(3)
         col1.metric("質問項目数", f"{len(questions):,}")
         col2.metric("取得ページ数", f"{page_count:,}")
-        col3.metric("対象期間", f"{start_year}〜{datetime.now().year}")
+        col3.metric("対象期間", "2023年5月〜現任期終了")
 
         # 「その他・要確認」は分類の精度を確認できていないため、円グラフから除外。
         chart_questions = questions[
@@ -561,6 +576,30 @@ else:
                 st.markdown(f"**初期：{min(first_years)}〜{max(first_years)}年 / 直近：{min(last_years)}〜{max(last_years)}年**")
                 st.dataframe(compare.style.format({"初期期間割合":"{:.1%}", "直近期間割合":"{:.1%}", "変化（ポイント）":"{:+.1f}"}), use_container_width=True, hide_index=True)
                 st.caption("期間内の質問構成比を比較しています。質問項目数の違いによる影響を抑えるため割合で比較。『その他・要確認』は除外。")
+
+        st.subheader("議員別の質問件数（クリックして一覧を表示）")
+        count_table = (
+            questions.groupby("議員").size().rename("質問件数")
+            .reset_index().sort_values("質問件数", ascending=False)
+        )
+        cols = st.columns(3)
+        for idx, row in count_table.iterrows():
+            with cols[idx % 3]:
+                if st.button(
+                    f"{row['議員']}　{int(row['質問件数'])}件",
+                    key=f"member_count_{row['議員']}",
+                    use_container_width=True,
+                ):
+                    st.session_state["count_selected_member"] = row["議員"]
+        selected_count_member = st.session_state.get("count_selected_member")
+        if selected_count_member in set(questions["議員"]):
+            selected_questions = questions[questions["議員"] == selected_count_member].copy()
+            st.markdown(f"**{selected_count_member} 議員の質問一覧（{len(selected_questions)}件）**")
+            st.dataframe(
+                selected_questions[["年度", "会議", "質問項目", "テーマ（自動仮分類）", "公式資料URL"]],
+                use_container_width=True, hide_index=True,
+                column_config={"公式資料URL": st.column_config.LinkColumn("公式資料", display_text="資料を開く")},
+            )
 
         st.subheader("現職議員の質問傾向による大分類")
         classified = questions[questions["テーマ（自動仮分類）"] != "その他・要確認"]
