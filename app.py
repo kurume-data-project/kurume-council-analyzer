@@ -370,6 +370,29 @@ def theme_of(text):
     return "その他・要確認"
 
 
+def broad_member_type(theme_share, total_count):
+    """Transparent, rule-based descriptive grouping; not a value judgement."""
+    if total_count < 5 or theme_share.empty:
+        return "判定保留（質問数不足）", "分類済み質問が5件未満"
+    top_theme = theme_share.index[0]
+    top_share = float(theme_share.iloc[0])
+    if top_share < 0.35:
+        return "総合・幅広型", "特定テーマへの偏りが小さい"
+    groups = {
+        "子育て・教育重視型": ["子育て・教育"],
+        "福祉・生活重視型": ["高齢・介護・福祉"],
+        "防災・安全重視型": ["防災・危機管理"],
+        "都市基盤・交通重視型": ["道路・交通・都市整備"],
+        "産業・地域振興型": ["産業・農業・観光"],
+        "行政運営・財政型": ["行政運営・DX・財政"],
+        "環境・生活基盤型": ["環境・上下水道"],
+    }
+    for label, themes in groups.items():
+        if top_theme in themes:
+            return label, f"最多テーマ：{top_theme}（{top_share:.0%}）"
+    return "総合・幅広型", "複数テーマに分散"
+
+
 def text_clarity_indicators(text):
     """Transparent text indicators only; not a quality score."""
     value = str(text or "")
@@ -508,12 +531,65 @@ else:
             "発言回数や質問時間を示すものではありません。"
         )
 
+        st.subheader("質問テーマの変化")
+        trend = chart_questions.groupby(["年度", "テーマ（自動仮分類）"]).size().reset_index(name="件数")
+        if not trend.empty:
+            trend["年度"] = trend["年度"].astype(str)
+            st.plotly_chart(
+                px.bar(
+                    trend, x="年度", y="件数", color="テーマ（自動仮分類）",
+                    title="年度別・政策テーマ別の質問項目数",
+                ), use_container_width=True,
+            )
+            share_trend = trend.copy()
+            share_trend["割合"] = share_trend["件数"] / share_trend.groupby("年度")["件数"].transform("sum")
+            st.plotly_chart(
+                px.line(
+                    share_trend, x="年度", y="割合", color="テーマ（自動仮分類）",
+                    markers=True, title="政策テーマ別の構成比の推移",
+                ), use_container_width=True,
+            )
+            available_years = sorted(chart_questions["年度"].dropna().astype(int).unique())
+            if len(available_years) >= 2:
+                first_years = available_years[:min(3, len(available_years))]
+                last_years = available_years[-min(3, len(available_years)):]
+                first = chart_questions[chart_questions["年度"].isin(first_years)]["テーマ（自動仮分類）"].value_counts(normalize=True)
+                last = chart_questions[chart_questions["年度"].isin(last_years)]["テーマ（自動仮分類）"].value_counts(normalize=True)
+                compare = pd.concat([first.rename("初期期間割合"), last.rename("直近期間割合")], axis=1).fillna(0)
+                compare["変化（ポイント）"] = (compare["直近期間割合"] - compare["初期期間割合"]) * 100
+                compare = compare.sort_values("変化（ポイント）", ascending=False).reset_index(names="テーマ")
+                st.markdown(f"**初期：{min(first_years)}〜{max(first_years)}年 / 直近：{min(last_years)}〜{max(last_years)}年**")
+                st.dataframe(compare.style.format({"初期期間割合":"{:.1%}", "直近期間割合":"{:.1%}", "変化（ポイント）":"{:+.1f}"}), use_container_width=True, hide_index=True)
+                st.caption("期間内の質問構成比を比較しています。質問項目数の違いによる影響を抑えるため割合で比較。『その他・要確認』は除外。")
+
+        st.subheader("現職議員の質問傾向による大分類")
+        classified = questions[questions["テーマ（自動仮分類）"] != "その他・要確認"]
+        member_rows = []
+        for member, group in questions.groupby("議員"):
+            valid = group[group["テーマ（自動仮分類）"] != "その他・要確認"]
+            shares = valid["テーマ（自動仮分類）"].value_counts(normalize=True)
+            label, reason = broad_member_type(shares, len(valid))
+            member_rows.append({"議員": member, "質問項目数": len(group), "分類済み件数": len(valid), "質問傾向タイプ": label, "判定根拠": reason})
+        member_types = pd.DataFrame(member_rows)
+        if not member_types.empty:
+            st.plotly_chart(
+                px.bar(member_types[member_types["質問傾向タイプ"].str.startswith("判定保留") == False]["質問傾向タイプ"].value_counts().rename_axis("タイプ").reset_index(name="議員数"),
+                       x="タイプ", y="議員数", title="質問傾向タイプ別の議員数"),
+                use_container_width=True,
+            )
+            st.dataframe(member_types.sort_values(["質問傾向タイプ", "議員"]), use_container_width=True, hide_index=True)
+            st.caption("分類は分類済み質問が5件以上あり、最多テーマが35%以上の場合にテーマ別タイプとします。それ以外は総合・幅広型または判定保留。議員の思想・能力・実績を示すものではありません。")
+
     with t2:
         st.subheader("議員別の質問傾向")
         names = sorted(questions["議員"].dropna().unique())
         selected = st.selectbox("議員を選択", names)
         person = questions[questions["議員"] == selected]
         st.metric("取得できた質問項目数", len(person))
+        person_valid = person[person["テーマ（自動仮分類）"] != "その他・要確認"]
+        person_shares = person_valid["テーマ（自動仮分類）"].value_counts(normalize=True)
+        person_type, person_reason = broad_member_type(person_shares, len(person_valid))
+        st.info(f"質問傾向タイプ（参考）：**{person_type}**\n\n判定根拠：{person_reason}")
         st.dataframe(
             person[
                 [
