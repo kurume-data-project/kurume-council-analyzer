@@ -24,6 +24,10 @@ NEWS_INDEX = (
     "3060tayori/2019-0726-0924-175t1.html"
 )
 MINUTES_HOME = "https://www.kensakusystem.jp/kurume/"
+MEMBER_LIST_URL = (
+    "https://www.city.kurume.fukuoka.jp/1100keikaku/2040shigikai/"
+    "3020meibo/2019-0509-1504-175t1.html"
+)
 START_YEAR = 2018
 HEADERS = {
     "User-Agent": (
@@ -184,6 +188,35 @@ def split_question_items(cell):
 
     return records
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_current_members():
+    """Get current council members from Kurume City's official roster."""
+    soup = get_soup(MEMBER_LIST_URL)
+    members = set()
+
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["th", "td"], recursive=False)
+            if len(cells) < 2:
+                continue
+            seat = clean_text(cells[0].get_text(" ", strip=True))
+            if not re.fullmatch(r"[0-9０-９]+", seat):
+                continue
+            # The second column contains the name and, in parentheses, kana.
+            name = cells[1].get_text(" ", strip=True)
+            name = re.sub(r"[（(].*?[）)]", "", name)
+            key = normalize_member_name(name)
+            if key:
+                members.add(key)
+
+    if not members:
+        raise RuntimeError(
+            "久留米市公式の現職議員名簿を読み取れませんでした。"
+            "安全のため、全議員データを表示せず取得を停止しました。"
+        )
+    return members
+
+
 def parse_question_page(page_url, year, meeting_title):
     """Parse the official questioner/question-item tables.
 
@@ -263,7 +296,10 @@ def fetch_general_questions(start_year=START_YEAR):
         "本文取得状況",
     ]
     df = pd.DataFrame(all_rows, columns=columns)
+    # Limit analysis to people currently listed as Kurume City council members.
+    current_members = fetch_current_members()
     if not df.empty:
+        df = df[df["議員"].map(normalize_member_name).isin(current_members)].copy()
         df = df.drop_duplicates(
             subset=["年度", "会議", "議員", "質問番号", "小項目番号", "質問項目"]
         ).reset_index(drop=True)
@@ -371,7 +407,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.caption("取得元：久留米市公式サイト")
-    st.caption("取得結果には出典URL・取得日時を保持します。")
+    st.caption("分析対象：公式名簿に掲載された現職議員のみ")
+    st.caption("現職議員の2018年以降の質問履歴を集計します。")
+    st.caption("現職名簿：" + MEMBER_LIST_URL)
 
 try:
     with st.spinner("久留米市公式サイトから一般質問表を取得しています…"):
@@ -405,7 +443,7 @@ else:
     questions = pd.concat([questions, indicator_frame], axis=1)
 
     st.success(
-        f"一般質問の項目を {len(questions):,} 件取得しました"
+        f"現職議員の質問項目を {len(questions):,} 件取得しました"
         f"（対象ページ {page_count:,} 件）。"
     )
     if fetch_errors:
@@ -437,9 +475,12 @@ else:
             .reset_index(name="件数")
         )
         st.plotly_chart(
-            px.bar(
-                theme_counts, x="テーマ", y="件数",
-                title="政策テーマ別の質問項目数",
+            px.pie(
+                theme_counts,
+                names="テーマ",
+                values="件数",
+                title="政策テーマ別の質問項目割合",
+                hole=0.35,
             ),
             use_container_width=True,
         )
@@ -483,9 +524,12 @@ else:
             .reset_index(name="件数")
         )
         st.plotly_chart(
-            px.bar(
-                ptheme, x="テーマ", y="件数",
-                title=f"{selected}さんのテーマ傾向",
+            px.pie(
+                ptheme,
+                names="テーマ",
+                values="件数",
+                title=f"{selected}さんの質問テーマ割合",
+                hole=0.35,
             ),
             use_container_width=True,
         )
