@@ -97,76 +97,91 @@ def discover_general_pages(start_year=START_YEAR):
 
 
 def split_question_items(cell):
-    """親質問を抽出する。小項目は分割せず、別テーマの「について」は区切る。"""
-    fragment = BeautifulSoup(str(cell), "html.parser")
-    for br in fragment.find_all("br"):
-        _ = br.replace_with("\n")
-    for tag in fragment.find_all(["p", "div", "li"]):
-        _ = tag.insert_before("\n")
-        _ = tag.insert_after("\n")
+    """Return atomic question items, preserving their parent headings.
 
-
-    raw = unicodedata.normalize("NFKC", fragment.get_text("", strip=False))
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    A main item (1., 2.) is retained as the parent. If it has sub-items
+    ((1), ア, イ, etc.), each sub-item becomes an individual record.
+    Continuation lines stay with the immediately preceding item.
+    """
+    raw = cell.get_text("\n", strip=True)
     lines = []
-    for value in raw.split("\n"):
-        value = re.sub(r"[ \t　]+", " ", value).strip()
-        if value and value not in {"None", "nan", "[\\n]"}:
-            lines.append(value)
+    for raw_line in raw.splitlines():
+        line = unicodedata.normalize("NFKC", raw_line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            lines.append(line)
 
-    # 1. / 1． / 1、などの番号は親質問の区切りとして扱う。
-    main_re = re.compile(r"^([0-9]{1,2})\s*[.．、)）]\s*(.*)$")
-    groups = []
-    current = None
+    main_re = re.compile(r"^([0-9]+)\s*[.．、)]\s*(.*)$")
+    paren_re = re.compile(r"^[（(]\s*([0-9]+)\s*[）)]\s*(.*)$")
+    kana_re = re.compile(r"^([アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワ])(?:[.．、]|\s+)\s*(.*)$")
+    sub_re = re.compile(r"^([0-9]+)\s*[）)]\s*(.*)$")
 
-    def add_text(text):
-        nonlocal current
-        text = clean_text(text)
-        if not text:
-            return
-        if current is None:
-            current = {"番号": "", "本文": text}
-            groups.append(current)
-        else:
-            current["本文"] = (current["本文"] + " " + text).strip()
+    mains = []
+    current_main = None
+    current_sub = None
 
     for line in lines:
-        match = main_re.match(line)
-        if match:
-            current = {"番号": match.group(1), "本文": match.group(2).strip()}
-            groups.append(current)
-        else:
-            add_text(line)
+        m = main_re.match(line)
+        if m:
+            current_main = {
+                "parent_number": m.group(1),
+                "parent_title": m.group(2).strip(),
+                "children": [],
+            }
+            mains.append(current_main)
+            current_sub = None
+            continue
 
-    # 番号がない資料では、「○○について」と「△△について」が
-    # 同じ行に並んでいる場合だけ、明確な句読点・空白を境に分ける。
-    expanded = []
-    for group in groups:
-        text = group["本文"]
-        # 「について、」の直後が次の独立した話題見出しである場合を検出。
-        # 文中の「○○について、検討する」のような通常の文章は分けない。
-        parts = re.split(r"(?<=について)[。；;]\s*|(?<=について)\s{2,}", text)
-        parts = [clean_text(part) for part in parts if clean_text(part)]
-        if len(parts) > 1:
-            for index, part in enumerate(parts):
-                expanded.append({"番号": group["番号"] if index == 0 else "", "本文": part})
+        m = paren_re.match(line) or kana_re.match(line) or sub_re.match(line)
+        if m and current_main is not None:
+            current_sub = {
+                "sub_number": m.group(1),
+                "sub_title": m.group(2).strip(),
+                "detail": [],
+            }
+            current_main["children"].append(current_sub)
+            continue
+
+        # Indented continuation / additional descriptive line.
+        if current_sub is not None:
+            current_sub["detail"].append(line)
+        elif current_main is not None:
+            current_main["parent_title"] = (
+                current_main["parent_title"] + " " + line
+            ).strip()
         else:
-            expanded.append(group)
+            # Text before the first numbered item is kept as a standalone item.
+            mains.append({
+                "parent_number": "",
+                "parent_title": line,
+                "children": [],
+            })
+            current_main = mains[-1]
 
     records = []
-    for item in expanded:
-        title = clean_text(item["本文"])
-        if not title:
-            continue
-        records.append({
-            "質問番号": item["番号"],
-            "質問項目": title,
-            "質問詳細": "",
-            "親質問番号": item["番号"],
-            "親質問項目": title,
-            "小項目番号": "",
-            "分割階層": "親質問",
-        })
+    for main in mains:
+        if main["children"]:
+            for child in main["children"]:
+                records.append({
+                    "質問番号": main["parent_number"],
+                    "質問項目": child["sub_title"],
+                    "質問詳細": "\n".join(child["detail"]),
+                    "親質問番号": main["parent_number"],
+                    "親質問項目": main["parent_title"],
+                    "小項目番号": child["sub_number"],
+                    "分割階層": "小項目",
+                })
+        else:
+            records.append({
+                "質問番号": main["parent_number"],
+                "質問項目": main["parent_title"],
+                "質問詳細": "",
+                "親質問番号": "",
+                "親質問項目": "",
+                "小項目番号": "",
+                "分割階層": "大項目",
+            })
+
     return records
 
 def parse_question_page(page_url, year, meeting_title):
