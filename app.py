@@ -468,22 +468,29 @@ else:
         col2.metric("取得ページ数", f"{page_count:,}")
         col3.metric("対象期間", f"{start_year}〜{datetime.now().year}")
 
+        # 「その他・要確認」は分類の精度を確認できていないため、円グラフから除外。
+        chart_questions = questions[
+            questions["テーマ（自動仮分類）"] != "その他・要確認"
+        ]
         theme_counts = (
-            questions["テーマ（自動仮分類）"]
+            chart_questions["テーマ（自動仮分類）"]
             .value_counts()
             .rename_axis("テーマ")
             .reset_index(name="件数")
         )
-        st.plotly_chart(
-            px.pie(
-                theme_counts,
-                names="テーマ",
-                values="件数",
-                title="政策テーマ別の質問項目割合",
-                hole=0.35,
-            ),
-            use_container_width=True,
-        )
+        if not theme_counts.empty:
+            st.plotly_chart(
+                px.pie(
+                    theme_counts,
+                    names="テーマ",
+                    values="件数",
+                    title="政策テーマ別の質問項目割合（その他・要確認を除く）",
+                    hole=0.35,
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info("円グラフに表示できる分類済みデータがありません。")
         yearly = (
             questions.groupby("年度")
             .size()
@@ -517,22 +524,28 @@ else:
             use_container_width=True,
             hide_index=True,
         )
+        person_chart = person[
+            person["テーマ（自動仮分類）"] != "その他・要確認"
+        ]
         ptheme = (
-            person["テーマ（自動仮分類）"]
+            person_chart["テーマ（自動仮分類）"]
             .value_counts()
             .rename_axis("テーマ")
             .reset_index(name="件数")
         )
-        st.plotly_chart(
-            px.pie(
-                ptheme,
-                names="テーマ",
-                values="件数",
-                title=f"{selected}さんの質問テーマ割合",
-                hole=0.35,
-            ),
-            use_container_width=True,
-        )
+        if not ptheme.empty:
+            st.plotly_chart(
+                px.pie(
+                    ptheme,
+                    names="テーマ",
+                    values="件数",
+                    title=f"{selected}さんの質問テーマ割合（その他・要確認を除く）",
+                    hole=0.35,
+                ),
+                use_container_width=True,
+            )
+        else:
+            st.info("この議員には円グラフに表示できる分類済みデータがありません。")
 
     with t3:
         st.subheader("取得した一般質問データ")
