@@ -1,4 +1,5 @@
 import re
+import hashlib
 import unicodedata
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -816,9 +817,28 @@ else:
         classify_theme(text, dept)
         for text, dept in zip(classification_text, questions["答弁担当部署"].fillna(""))
     ]
-    questions["テーマ（自動仮分類）"] = [item[0] for item in classification]
+    questions["自動判定テーマ"] = [item[0] for item in classification]
+    questions["テーマ（自動仮分類）"] = questions["自動判定テーマ"]
     questions["分類根拠"] = [item[1] for item in classification]
     questions["推定所管課（質問文から）"] = [item[2] for item in classification]
+
+    # Stable record key allows manual decisions to survive Streamlit reruns.
+    def question_record_id(row):
+        raw = "|".join(str(row.get(col, "")) for col in [
+            "年度", "会議", "議員", "質問番号", "小項目番号", "質問項目", "質問詳細"
+        ])
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+    questions["質問ID"] = questions.apply(question_record_id, axis=1)
+    manual_overrides = st.session_state.get("manual_theme_overrides", {})
+    for row_index, row in questions.iterrows():
+        manual_theme = manual_overrides.get(row["質問ID"])
+        if manual_theme and manual_theme != "その他・要確認":
+            questions.at[row_index, "テーマ（自動仮分類）"] = manual_theme
+            questions.at[row_index, "分類根拠"] = (
+                str(questions.at[row_index, "分類根拠"]) +
+                f" ／ 手動判定: {manual_theme}"
+            )
     indicator_frame = questions["質問項目"].apply(text_clarity_indicators).apply(pd.Series)
     questions = pd.concat([questions, indicator_frame], axis=1)
 
@@ -856,10 +876,8 @@ else:
         col2.metric("取得ページ数", f"{page_count:,}")
         col3.metric("対象期間", "2023年5月〜現任期終了")
 
-        # 「その他・要確認」は分類の精度を確認できていないため、円グラフから除外。
-        chart_questions = questions[
-            questions["テーマ（自動仮分類）"] != "その他・要確認"
-        ]
+        # 「その他・要確認」も独立した分類として件数・構成比に含める。
+        chart_questions = questions.copy()
         theme_counts = (
             chart_questions["テーマ（自動仮分類）"]
             .value_counts()
@@ -872,7 +890,7 @@ else:
                     theme_counts,
                     names="テーマ",
                     values="件数",
-                    title="政策テーマ別の質問項目割合（その他・要確認を除く）",
+                    title="政策テーマ別の質問項目割合（その他・要確認を含む）",
                     hole=0.35,
                 ),
                 use_container_width=True,
@@ -925,7 +943,7 @@ else:
                 compare = compare.sort_values("変化（ポイント）", ascending=False).reset_index(names="テーマ")
                 st.markdown(f"**初期：{min(first_years)}〜{max(first_years)}年 / 直近：{min(last_years)}〜{max(last_years)}年**")
                 st.dataframe(compare.style.format({"初期期間割合":"{:.1%}", "直近期間割合":"{:.1%}", "変化（ポイント）":"{:+.1f}"}), use_container_width=True, hide_index=True)
-                st.caption("期間内の質問構成比を比較しています。質問項目数の違いによる影響を抑えるため割合で比較。『その他・要確認』は除外。")
+                st.caption("期間内の質問構成比を比較しています。『その他・要確認』も独立した分類として含みます。")
 
         st.subheader("議員別の質問件数（クリックして一覧を表示）")
         count_table = (
@@ -989,9 +1007,7 @@ else:
             use_container_width=True,
             hide_index=True,
         )
-        person_chart = person[
-            person["テーマ（自動仮分類）"] != "その他・要確認"
-        ]
+        person_chart = person.copy()
         ptheme = (
             person_chart["テーマ（自動仮分類）"]
             .value_counts()
@@ -1004,7 +1020,7 @@ else:
                     ptheme,
                     names="テーマ",
                     values="件数",
-                    title=f"{selected}さんの質問テーマ割合（その他・要確認を除く）",
+                    title=f"{selected}さんの質問テーマ割合（その他・要確認を含む）",
                     hole=0.35,
                 ),
                 use_container_width=True,
@@ -1013,8 +1029,75 @@ else:
             st.info("この議員には円グラフに表示できる分類済みデータがありません。")
 
     with t3:
+        st.subheader("その他・要確認の手動判定")
+        unresolved = questions[
+            (questions["自動判定テーマ"] == "その他・要確認")
+            | questions["質問ID"].isin(st.session_state.get("manual_theme_overrides", {}).keys())
+        ].copy()
+        st.write(
+            f"現在『その他・要確認』の自動判定は {int((questions['自動判定テーマ'] == 'その他・要確認').sum())} 件です。"
+            "質問項目を確認し、適切なテーマを選んで保存できます。"
+        )
+        if unresolved.empty:
+            st.success("手動判定が必要な質問はありません。")
+        else:
+            edit_rows = []
+            for _, row in unresolved.iterrows():
+                edit_rows.append({
+                    "質問ID": row["質問ID"],
+                    "議員": row["議員"],
+                    "年度": row["年度"],
+                    "質問項目": row["質問項目"],
+                    "自動判定": row["自動判定テーマ"],
+                    "手動判定": st.session_state.get("manual_theme_overrides", {}).get(
+                        row["質問ID"], "その他・要確認"
+                    ),
+                })
+            edit_df = pd.DataFrame(edit_rows)
+            theme_options = list(DUTY_RULES.keys()) + ["その他・要確認"]
+            with st.form("manual_theme_review_form"):
+                edited_df = st.data_editor(
+                    edit_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=["質問ID", "議員", "年度", "質問項目", "自動判定"],
+                    column_config={
+                        "手動判定": st.column_config.SelectboxColumn(
+                            "手動判定（選択してください）",
+                            options=theme_options,
+                            required=True,
+                            help="質問内容を読んで最も適切な政策テーマを選びます。判断できない場合は『その他・要確認』のままにします。",
+                        )
+                    },
+                    key="manual_theme_editor",
+                )
+                save_manual = st.form_submit_button("手動判定を保存して分析に反映", type="primary")
+            if save_manual:
+                updated = dict(st.session_state.get("manual_theme_overrides", {}))
+                for _, edit_row in edited_df.iterrows():
+                    rid = edit_row["質問ID"]
+                    chosen = edit_row["手動判定"]
+                    if chosen == "その他・要確認":
+                        updated.pop(rid, None)
+                    else:
+                        updated[rid] = chosen
+                st.session_state["manual_theme_overrides"] = updated
+                st.success("手動判定を保存しました。ダッシュボードと議員別分析に反映します。")
+                st.rerun()
+            st.caption("手動判定はこのアプリのセッション中に保持されます。ブラウザを閉じた後も残したい場合は、判定結果をCSVで保存してください。")
+            manual_export = questions[["質問ID", "議員", "年度", "会議", "質問項目", "自動判定テーマ"]].copy()
+            manual_export["手動判定テーマ"] = manual_export["質問ID"].map(
+                st.session_state.get("manual_theme_overrides", {})
+            ).fillna("")
+            st.download_button(
+                "手動判定結果をCSV保存",
+                manual_export.to_csv(index=False).encode("utf-8-sig"),
+                "kurume_manual_theme_decisions.csv",
+                "text/csv",
+            )
+
         st.subheader("取得した一般質問データ")
-        st.caption("『推定所管課（質問文から）』は所掌事務キーワードによる推定です。実際の答弁部署とは異なる場合があります。『答弁担当部署』は会議録からの取得機能が未実装のため、現在は空欄です。")
+        st.caption("『その他・要確認』は件数に含み、手動判定でテーマを変更できます。『推定所管課』は質問文からの推定であり、答弁担当部署とは区別しています。")
         search = st.text_input("議員名・質問内容で検索")
         view = questions.copy()
         if search:
