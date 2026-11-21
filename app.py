@@ -276,6 +276,7 @@ def parse_question_page(page_url, year, meeting_title):
                         "公式資料URL": page_url,
                         "質問本文": "",
                         "答弁本文": "",
+                        "答弁担当部署": "",
                         "会議録URL": MINUTES_HOME,
                         "本文取得状況": "未取得：会議録で確認が必要",
                     }
@@ -309,7 +310,7 @@ def fetch_general_questions(start_year=TERM_START_YEAR):
         "年度", "会議", "議員", "議員表示名（公式表記）",
         "質問番号", "質問項目", "質問詳細", "親質問番号", "親質問項目",
         "小項目番号", "分割階層", "資料種別", "取得日時",
-        "公式資料URL", "質問本文", "答弁本文", "会議録URL",
+        "公式資料URL", "質問本文", "答弁本文", "答弁担当部署", "会議録URL",
         "本文取得状況",
     ]
     df = pd.DataFrame(all_rows, columns=columns)
@@ -352,39 +353,90 @@ def fetch_newsletter_links():
     return pd.DataFrame(rows)
 
 
+THEME_KEYWORDS = {
+    "子育て・教育": [
+        "子ども", "こども", "子育て", "保育", "保育所", "幼稚園", "認定こども園",
+        "学校", "教育", "不登校", "給食", "学童", "児童", "生徒", "通学", "奨学",
+        "放課後", "いじめ", "特別支援", "青少年", "母子保健", "妊産婦",
+    ],
+    "高齢・介護・福祉": [
+        "高齢", "介護", "福祉", "障害", "障がい", "生活保護", "医療", "健康",
+        "認知症", "地域包括", "介護保険", "国民健康保険", "孤独", "孤立", "生活困窮",
+        "自殺", "保健", "予防接種", "病院", "救急医療",
+    ],
+    "防災・危機管理": [
+        "防災", "災害", "避難", "豪雨", "消防", "地震", "水害", "浸水", "土砂",
+        "ハザード", "危機管理", "消防団", "備蓄", "避難所", "防犯", "交通安全",
+        "犯罪", "迷惑行為", "国民保護",
+    ],
+    "道路・交通・都市整備": [
+        "道路", "交通", "バス", "鉄道", "河川", "公園", "都市計画", "駅", "橋梁",
+        "歩道", "自転車", "渋滞", "空き家", "市営住宅", "住宅", "区画整理", "景観",
+        "立地適正化", "公共交通", "道路整備", "上下水道管", "インフラ",
+    ],
+    "産業・農業・観光": [
+        "農業", "農地", "農林", "商工", "観光", "企業", "産業", "雇用", "創業",
+        "中小企業", "事業者", "地場産業", "商店街", "ふるさと納税", "物産", "販路",
+        "後継者", "有害鳥獣", "漁業", "農産物",
+    ],
+    "行政運営・DX・財政": [
+        "財政", "予算", "行政", "DX", "デジタル", "職員", "市政", "窓口", "公共施設",
+        "情報公開", "個人情報", "マイナンバー", "電子申請", "業務改善", "人事", "組織",
+        "契約", "入札", "税", "市税", "収納", "監査", "広報", "広聴", "議会",
+        "自治体", "公民連携", "指定管理", "公共調達", "庁舎",
+    ],
+    "環境・上下水道": [
+        "環境", "ごみ", "廃棄物", "リサイクル", "水道", "下水", "脱炭素", "エネルギー",
+        "温暖化", "再生可能", "太陽光", "生物多様性", "河川水質", "騒音", "大気",
+        "浄化槽", "資源循環", "食品ロス", "ゼロカーボン",
+    ],
+}
+
+# 部署名が会議録等から取得できた場合に使う補助キーワード。
+# 現在の一般質問表には答弁担当部署がないため、未取得のまま空欄で保持する。
+DEPARTMENT_KEYWORDS = {
+    "子育て・教育": ["学校教育", "教育委員会", "子ども未来", "こども", "保育", "幼児教育"],
+    "高齢・介護・福祉": ["健康福祉", "福祉", "介護", "地域包括", "保健所"],
+    "防災・危機管理": ["防災", "危機管理", "消防", "安全安心"],
+    "道路・交通・都市整備": ["都市建設", "建設", "道路", "都市計画", "交通政策", "上下水道"],
+    "産業・農業・観光": ["農政", "商工", "観光", "産業", "農業", "企業誘致"],
+    "行政運営・DX・財政": ["総務", "企画", "財政", "情報政策", "人事", "市民文化", "税務"],
+    "環境・上下水道": ["環境", "資源循環", "ごみ", "環境部", "上下水道"],
+}
+
+
+def classify_theme(text, department=""):
+    """Classify by question wording first, then use answer department as a supplement."""
+    value = clean_text(text)
+    dept = clean_text(department)
+    scores = {}
+    matched = {}
+    for theme, words in THEME_KEYWORDS.items():
+        hits = [word for word in words if word in value]
+        if hits:
+            scores[theme] = len(hits)
+            matched[theme] = hits
+    # Department information is supplementary, not a substitute for question content.
+    for theme, words in DEPARTMENT_KEYWORDS.items():
+        dept_hits = [word for word in words if word in dept]
+        if dept_hits:
+            scores[theme] = scores.get(theme, 0) + 2 * len(dept_hits)
+            matched.setdefault(theme, []).extend([f"部署:{word}" for word in dept_hits])
+    if not scores:
+        return "その他・要確認", "該当キーワードなし"
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        top_score = ranked[0][1]
+        tied = [theme for theme, score in ranked if score == top_score]
+        return "その他・要確認", "複数分野が同程度に該当: " + " / ".join(tied)
+    theme = ranked[0][0]
+    evidence = "、".join(matched.get(theme, [])[:6])
+    return theme, f"該当語: {evidence}"
+
+
 def theme_of(text):
-    rules = {
-        "子育て・教育": [
-            "子ども", "子育て", "保育", "学校", "教育", "不登校",
-            "給食", "学童", "児童", "生徒",
-        ],
-        "高齢・介護・福祉": [
-            "高齢", "介護", "福祉", "障害", "生活保護", "医療",
-            "健康", "認知症",
-        ],
-        "防災・危機管理": [
-            "防災", "災害", "避難", "豪雨", "消防", "地震", "水害",
-        ],
-        "道路・交通・都市整備": [
-            "道路", "交通", "バス", "鉄道", "河川", "公園",
-            "都市計画", "駅",
-        ],
-        "産業・農業・観光": [
-            "農業", "商工", "観光", "企業", "産業", "雇用", "創業",
-        ],
-        "行政運営・DX・財政": [
-            "財政", "予算", "行政", "DX", "デジタル", "職員",
-            "市政", "窓口", "公共施設",
-        ],
-        "環境・上下水道": [
-            "環境", "ごみ", "水道", "下水", "脱炭素", "エネルギー",
-        ],
-    }
-    value = str(text or "")
-    for theme, words in rules.items():
-        if any(word in value for word in words):
-            return theme
-    return "その他・要確認"
+    # Backward-compatible wrapper used where only one text field is available.
+    return classify_theme(text)[0]
 
 
 def broad_member_type(theme_share, total_count):
@@ -476,13 +528,31 @@ elif questions.empty:
             hide_index=True,
         )
 else:
-    questions["テーマ（自動仮分類）"] = questions["質問項目"].apply(theme_of)
+    # 質問項目・親質問項目・質問詳細をまとめて分類に使う。
+    # 答弁担当部署は現行の一般質問表から取得できないため、列が空欄なら質問文のみで判定。
+    classification_text = (
+        questions["質問項目"].fillna("") + " "
+        + questions["親質問項目"].fillna("") + " "
+        + questions["質問詳細"].fillna("")
+    )
+    classification = [
+        classify_theme(text, dept)
+        for text, dept in zip(classification_text, questions["答弁担当部署"].fillna(""))
+    ]
+    questions["テーマ（自動仮分類）"] = [item[0] for item in classification]
+    questions["分類根拠"] = [item[1] for item in classification]
     indicator_frame = questions["質問項目"].apply(text_clarity_indicators).apply(pd.Series)
     questions = pd.concat([questions, indicator_frame], axis=1)
 
     st.success(
         f"現職議員の質問項目を {len(questions):,} 件取得しました"
         f"（対象ページ {page_count:,} 件）。"
+    )
+    st.info(
+        "テーマ分類は質問項目・親質問項目・質問詳細のキーワードを複数照合して行います。"
+        "同点で複数分野に該当する場合は『その他・要確認』に残します。"
+        "答弁担当部署の情報は現在の一般質問表に掲載されていないため、"
+        "現時点では部署による補正は未適用です。会議録から部署情報を取得できた場合に補助判定へ反映します。"
     )
     if fetch_errors:
         with st.expander(f"取得時の注意（{len(fetch_errors)}件）"):
@@ -596,7 +666,7 @@ else:
             selected_questions = questions[questions["議員"] == selected_count_member].copy()
             st.markdown(f"**{selected_count_member} 議員の質問一覧（{len(selected_questions)}件）**")
             st.dataframe(
-                selected_questions[["年度", "会議", "質問項目", "テーマ（自動仮分類）", "公式資料URL"]],
+                selected_questions[["年度", "会議", "質問項目", "テーマ（自動仮分類）", "分類根拠", "答弁担当部署", "公式資料URL"]],
                 use_container_width=True, hide_index=True,
                 column_config={"公式資料URL": st.column_config.LinkColumn("公式資料", display_text="資料を開く")},
             )
@@ -633,7 +703,7 @@ else:
             person[
                 [
                     "年度", "会議", "テーマ（自動仮分類）",
-                    "質問項目", "公式資料URL",
+                    "質問項目", "分類根拠", "答弁担当部署", "公式資料URL",
                 ]
             ],
             use_container_width=True,
@@ -664,6 +734,7 @@ else:
 
     with t3:
         st.subheader("取得した一般質問データ")
+        st.caption("『分類根拠』で自動判定に使った語句を確認できます。『答弁担当部署』は会議録からの取得機能が未実装のため、現在は空欄です。")
         search = st.text_input("議員名・質問内容で検索")
         view = questions.copy()
         if search:
