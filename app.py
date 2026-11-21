@@ -326,6 +326,76 @@ def fetch_general_questions(start_year=TERM_START_YEAR):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+
+def extract_docx_text(uploaded_file):
+    """Extract paragraph and table text from a downloaded council-minutes DOCX."""
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    with zipfile.ZipFile(uploaded_file) as archive:
+        xml_bytes = archive.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    lines = []
+    body = root.find("w:body", ns)
+    if body is None:
+        return ""
+    for node in body:
+        tag = node.tag.split("}")[-1]
+        if tag == "p":
+            text = "".join(t.text or "" for t in node.findall(".//w:t", ns))
+            if clean_text(text):
+                lines.append(clean_text(text))
+        elif tag == "tbl":
+            for row in node.findall(".//w:tr", ns):
+                cells = []
+                for cell in row.findall("w:tc", ns):
+                    value = " ".join(
+                        clean_text("".join(t.text or "" for t in para.findall(".//w:t", ns)))
+                        for para in cell.findall(".//w:p", ns)
+                    )
+                    if value:
+                        cells.append(value)
+                if cells:
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def split_minutes_speakers(text):
+    """Split DOCX text into speaker turns using common Japanese minutes labels.
+
+    This is a review aid, not a guaranteed question/answer semantic parser.
+    """
+    speaker_re = re.compile(
+        r"^(?P<speaker>[^：:]{1,45}?(?:議員|君|市長|副市長|教育長|部長|局長|課長|委員長|事務局長))\s*[：:]\s*(?P<body>.*)$"
+    )
+    turns = []
+    current_speaker = ""
+    current_lines = []
+
+    def flush():
+        if current_lines:
+            body = "\n".join(current_lines).strip()
+            if body:
+                role = "答弁側候補" if re.search(r"市長|副市長|教育長|部長|局長|課長|事務局長", current_speaker) else "質問・発言側候補"
+                turns.append({"発言者": current_speaker or "発言者未判定", "区分（推定）": role, "発言内容": body})
+
+    for line in text.splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+        match = speaker_re.match(line)
+        if match:
+            flush()
+            current_speaker = clean_text(match.group("speaker"))
+            current_lines = [clean_text(match.group("body"))] if clean_text(match.group("body")) else []
+        elif current_lines:
+            current_lines.append(line)
+        else:
+            current_lines = [line]
+    flush()
+    return turns
+
 def fetch_newsletter_links():
     soup = get_soup(NEWS_INDEX)
     rows = []
@@ -353,89 +423,134 @@ def fetch_newsletter_links():
     return pd.DataFrame(rows)
 
 
-THEME_KEYWORDS = {
-    "子育て・教育": [
-        "子ども", "こども", "子育て", "保育", "保育所", "幼稚園", "認定こども園",
-        "学校", "教育", "不登校", "給食", "学童", "児童", "生徒", "通学", "奨学",
-        "放課後", "いじめ", "特別支援", "青少年", "母子保健", "妊産婦",
-    ],
-    "高齢・介護・福祉": [
-        "高齢", "介護", "福祉", "障害", "障がい", "生活保護", "医療", "健康",
-        "認知症", "地域包括", "介護保険", "国民健康保険", "孤独", "孤立", "生活困窮",
-        "自殺", "保健", "予防接種", "病院", "救急医療",
-    ],
-    "防災・危機管理": [
-        "防災", "災害", "避難", "豪雨", "消防", "地震", "水害", "浸水", "土砂",
-        "ハザード", "危機管理", "消防団", "備蓄", "避難所", "防犯", "交通安全",
-        "犯罪", "迷惑行為", "国民保護",
-    ],
-    "道路・交通・都市整備": [
-        "道路", "交通", "バス", "鉄道", "河川", "公園", "都市計画", "駅", "橋梁",
-        "歩道", "自転車", "渋滞", "空き家", "市営住宅", "住宅", "区画整理", "景観",
-        "立地適正化", "公共交通", "道路整備", "上下水道管", "インフラ",
-    ],
-    "産業・農業・観光": [
-        "農業", "農地", "農林", "商工", "観光", "企業", "産業", "雇用", "創業",
-        "中小企業", "事業者", "地場産業", "商店街", "ふるさと納税", "物産", "販路",
-        "後継者", "有害鳥獣", "漁業", "農産物",
-    ],
-    "行政運営・DX・財政": [
-        "財政", "予算", "行政", "DX", "デジタル", "職員", "市政", "窓口", "公共施設",
-        "情報公開", "個人情報", "マイナンバー", "電子申請", "業務改善", "人事", "組織",
-        "契約", "入札", "税", "市税", "収納", "監査", "広報", "広聴", "議会",
-        "自治体", "公民連携", "指定管理", "公共調達", "庁舎",
-    ],
-    "環境・上下水道": [
-        "環境", "ごみ", "廃棄物", "リサイクル", "水道", "下水", "脱炭素", "エネルギー",
-        "温暖化", "再生可能", "太陽光", "生物多様性", "河川水質", "騒音", "大気",
-        "浄化槽", "資源循環", "食品ロス", "ゼロカーボン",
-    ],
-}
+# 久留米市行政組織規則・別表第1/第4の分掌事務を読み取り、
+# その事務内容に現れる語句を分類辞書として整理したもの。
+# 公式規則URLは SOURCE_DUTIES_URL を参照。
+SOURCE_DUTIES_URL = "https://www1.city.kurume.fukuoka.jp/reiki_int/reiki_honbun/q005RG00000062.html"
 
-# 部署名が会議録等から取得できた場合に使う補助キーワード。
-# 現在の一般質問表には答弁担当部署がないため、未取得のまま空欄で保持する。
-DEPARTMENT_KEYWORDS = {
-    "子育て・教育": ["学校教育", "教育委員会", "子ども未来", "こども", "保育", "幼児教育"],
-    "高齢・介護・福祉": ["健康福祉", "福祉", "介護", "地域包括", "保健所"],
-    "防災・危機管理": ["防災", "危機管理", "消防", "安全安心"],
-    "道路・交通・都市整備": ["都市建設", "建設", "道路", "都市計画", "交通政策", "上下水道"],
-    "産業・農業・観光": ["農政", "商工", "観光", "産業", "農業", "企業誘致"],
-    "行政運営・DX・財政": ["総務", "企画", "財政", "情報政策", "人事", "市民文化", "税務"],
-    "環境・上下水道": ["環境", "資源循環", "ごみ", "環境部", "上下水道"],
+# 各課の分掌事務をもとにした「質問文→推定所管課→政策テーマ」の対応表。
+# ここでの所管課は質問文からの推定であり、実際の答弁部署を示すものではない。
+DUTY_RULES = {
+    "子育て・教育": {
+        "子ども政策課": ["子育て支援", "次世代育成", "子ども・子育て支援事業計画", "児童遊園", "学童保育", "少子化"],
+        "子ども保育課": ["教育・保育の認定", "保育施設", "保育所", "幼稚園", "認定こども園", "保育士", "保育料", "入所"],
+        "家庭子ども相談課": ["家庭児童相談", "ひとり親", "児童手当", "児童扶養手当", "母子生活支援"],
+        "こども子育てサポートセンター": ["母子保健", "妊産婦", "乳幼児", "子育て相談", "児童センター"],
+        "青少年育成課": ["青少年", "若者相談", "非行", "薬物乱用"],
+        "学校教育課": ["学校教育", "学習指導", "教職員", "不登校", "いじめ", "特別支援教育", "学校給食"],
+        "学校施設課": ["学校施設", "校舎", "体育館", "通学路"],
+    },
+    "高齢・介護・福祉": {
+        "長寿支援課": ["高齢者福祉", "老人福祉", "地域包括支援", "高齢者相談", "認知症", "介護予防"],
+        "介護保険課": ["介護保険", "介護サービス", "要介護", "要支援", "介護認定", "介護保険料"],
+        "障害者福祉課": ["障害者福祉", "障がい者", "障害福祉サービス", "障害者手帳", "自立支援医療"],
+        "生活支援第1課": ["生活保護", "生活援護", "保護費", "社会援護"],
+        "生活支援第2課": ["生活困窮者", "生活困窮", "自立相談", "生活相談"],
+        "地域福祉課": ["地域福祉", "民生委員", "社会福祉", "福祉活動"],
+        "健康推進課": ["健康づくり", "健康診査", "特定健康診査", "保健指導", "健康相談", "在宅医療", "栄養指導", "歯科保健"],
+        "地域保健課": ["地域保健", "保健センター", "感染症", "予防接種"],
+        "医療・年金課": ["国民健康保険", "後期高齢者医療", "国民年金", "医療費助成"],
+    },
+    "防災・危機管理": {
+        "防災対策課": ["防災", "災害対策", "避難", "避難所", "国民保護", "消防団", "危機管理", "地域防災計画", "備蓄"],
+        "安全安心推進課": ["交通安全", "防犯", "犯罪", "暴力団", "安全安心", "消費生活"],
+        "河川課": ["浸水", "内水", "水害", "河川整備", "排水機", "樋門", "流域治水"],
+    },
+    "道路・交通・都市整備": {
+        "都市計画課": ["都市計画", "土地利用", "土地区画整理", "景観", "開発許可", "都市施設"],
+        "交通政策課": ["公共交通", "公共輸送", "バス", "鉄道", "自転車利用", "駐車場", "放置自転車"],
+        "国県事業調整課": ["国県道", "幹線道路", "国県河川", "治水"],
+        "まちなか整備課": ["中心市街地", "まちなか整備", "市街地再整備"],
+        "住宅政策課": ["住宅政策", "空き家", "空家", "マンション", "賃貸住宅", "住宅セーフティネット"],
+        "市営住宅課": ["市営住宅", "市営団地", "市営住宅家賃"],
+        "公園緑化推進課": ["公園", "緑地", "緑化", "街路樹"],
+        "路政課": ["道路占用", "道路境界", "道路台帳", "私道"],
+        "道路整備課": ["道路整備", "道路改良", "橋りょう", "橋梁", "歩道", "街路事業"],
+        "河川課": ["河川", "水路", "排水", "浸水被害", "治水"],
+        "建築指導課": ["建築基準", "建築確認", "耐震", "既存建築物", "建築物防災"],
+    },
+    "産業・農業・観光": {
+        "農政課": ["農業政策", "農地", "農業振興", "認定農業者", "新規就農", "担い手", "耕作放棄地", "集落営農"],
+        "農業の魅力促進課": ["地産地消", "農産物", "農業ブランド", "道の駅", "食育", "農業公園", "緑花木"],
+        "生産流通課": ["農産物生産", "農産物流通", "園芸", "畜産", "農業用施設"],
+        "商工政策課": ["商工業", "中小企業", "商店街", "創業", "企業支援", "雇用", "労働"],
+        "観光・国際課": ["観光", "観光振興", "コンベンション", "国際交流", "インバウンド"],
+        "企業誘致推進課": ["企業誘致", "工場立地", "企業立地", "産業団地"],
+    },
+    "行政運営・DX・財政": {
+        "総合政策課": ["総合政策", "総合計画", "重要施策", "政策調整", "広域行政"],
+        "財政課": ["予算編成", "財政計画", "市債", "地方交付税", "基金", "財政"],
+        "広報戦略課": ["広報", "市政広報", "情報発信", "シティプロモーション"],
+        "情報政策課": ["情報政策", "情報処理システム", "情報セキュリティ", "デジタル", "DX", "電子申請"],
+        "行財政改革推進課": ["行財政改革", "行政改革", "業務改善", "民間委託", "指定管理"],
+        "人事厚生課": ["職員人事", "職員採用", "定員管理", "職員厚生"],
+        "契約課": ["契約", "入札", "公共調達"],
+        "法制室": ["条例", "規則", "法令", "情報公開", "個人情報保護", "行政不服審査"],
+        "市民税課": ["市民税", "個人住民税", "法人市民税", "軽自動車税"],
+        "資産税課": ["固定資産税", "都市計画税", "土地評価", "家屋評価"],
+        "税収納推進課": ["市税収納", "滞納", "徴収", "納税"],
+        "総務課": ["市議会", "行政一般", "ふるさと納税", "統計", "市勢要覧"],
+    },
+    "環境・上下水道": {
+        "環境政策課": ["環境政策", "環境美化", "地球温暖化", "温暖化対策", "環境衛生"],
+        "廃棄物指導課": ["廃棄物処理施設", "産業廃棄物", "不法投棄", "建設廃棄物", "廃棄物処理業"],
+        "環境保全課": ["公害", "自然環境", "防疫", "害虫", "そ族", "騒音", "大気汚染"],
+        "資源循環推進課": ["ごみ減量", "ごみ", "リサイクル", "一般廃棄物", "ごみ収集", "資源循環"],
+        "上下水道部": ["水道", "下水道", "給水", "排水設備", "浄水", "水質", "漏水"],
+    },
+    "文化・市民協働": {
+        "協働推進課": ["市民協働", "市民活動", "NPO", "ボランティア"],
+        "地域コミュニティ課": ["自治会", "地域コミュニティ", "校区", "まちづくり"],
+        "人権・同和対策課": ["人権", "同和", "差別", "男女平等", "ジェンダー"],
+        "文化振興課": ["文化芸術", "文化振興", "文化施設", "シティプラザ"],
+        "生涯学習推進課": ["生涯学習", "社会教育", "図書館", "公民館"],
+        "スポーツ政策課": ["スポーツ", "体育施設", "競技", "運動施設"],
+    },
 }
 
 
 def classify_theme(text, department=""):
-    """Classify by question wording first, then use answer department as a supplement."""
+    """Match question wording against keywords derived from Kurume City's official duties."""
     value = clean_text(text)
     dept = clean_text(department)
-    scores = {}
-    matched = {}
-    for theme, words in THEME_KEYWORDS.items():
-        hits = [word for word in words if word in value]
-        if hits:
-            scores[theme] = len(hits)
-            matched[theme] = hits
-    # Department information is supplementary, not a substitute for question content.
-    for theme, words in DEPARTMENT_KEYWORDS.items():
-        dept_hits = [word for word in words if word in dept]
-        if dept_hits:
-            scores[theme] = scores.get(theme, 0) + 2 * len(dept_hits)
-            matched.setdefault(theme, []).extend([f"部署:{word}" for word in dept_hits])
-    if not scores:
-        return "その他・要確認", "該当キーワードなし"
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
-        top_score = ranked[0][1]
-        tied = [theme for theme, score in ranked if score == top_score]
-        return "その他・要確認", "複数分野が同程度に該当: " + " / ".join(tied)
-    theme = ranked[0][0]
-    evidence = "、".join(matched.get(theme, [])[:6])
-    return theme, f"該当語: {evidence}"
+    theme_scores = {}
+    theme_evidence = {}
+    dept_scores = {}
+
+    for theme, departments in DUTY_RULES.items():
+        for dept_name, keywords in departments.items():
+            hits = [word for word in keywords if word and word in value]
+            if hits:
+                # Each distinct duty keyword contributes one point; longer phrases are retained as evidence.
+                theme_scores[theme] = theme_scores.get(theme, 0) + len(hits)
+                theme_evidence.setdefault(theme, []).extend(hits)
+                dept_scores[dept_name] = dept_scores.get(dept_name, 0) + len(hits)
+
+    # If an actual answer department is later obtained from the minutes, it is used as corroborating evidence.
+    if dept:
+        for theme, departments in DUTY_RULES.items():
+            for dept_name in departments:
+                if dept_name in dept:
+                    theme_scores[theme] = theme_scores.get(theme, 0) + 3
+                    theme_evidence.setdefault(theme, []).append(f"答弁部署:{dept_name}")
+                    dept_scores[dept_name] = dept_scores.get(dept_name, 0) + 3
+
+    if not theme_scores:
+        return "その他・要確認", "所掌事務に対応する語句なし", ""
+
+    ordered = sorted(theme_scores.items(), key=lambda item: item[1], reverse=True)
+    if len(ordered) > 1 and ordered[0][1] == ordered[1][1]:
+        tied_themes = [name for name, score in ordered if score == ordered[0][1]]
+        return "その他・要確認", "複数の所掌分野が同点: " + " / ".join(tied_themes), ""
+
+    theme = ordered[0][0]
+    top_departments = [name for name, score in dept_scores.items() if score == max(dept_scores.values())]
+    estimated_dept = "・".join(top_departments[:2])
+    evidence = "、".join(dict.fromkeys(theme_evidence.get(theme, [])))
+    return theme, f"所掌事務キーワード: {evidence[:180]}", estimated_dept
 
 
 def theme_of(text):
-    # Backward-compatible wrapper used where only one text field is available.
     return classify_theme(text)[0]
 
 
@@ -497,6 +612,8 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.caption("取得元：久留米市公式サイト")
+    st.caption("分類基準：久留米市行政組織規則・分掌事務")
+    st.markdown(f"[公式の行政組織規則を確認]({SOURCE_DUTIES_URL})")
     st.caption("分析対象：公式名簿に掲載された現職議員のみ")
     st.caption("現任期中の一般質問のみを集計します。")
     st.caption("現職名簿：" + MEMBER_LIST_URL)
@@ -541,6 +658,7 @@ else:
     ]
     questions["テーマ（自動仮分類）"] = [item[0] for item in classification]
     questions["分類根拠"] = [item[1] for item in classification]
+    questions["推定所管課（質問文から）"] = [item[2] for item in classification]
     indicator_frame = questions["質問項目"].apply(text_clarity_indicators).apply(pd.Series)
     questions = pd.concat([questions, indicator_frame], axis=1)
 
@@ -549,23 +667,25 @@ else:
         f"（対象ページ {page_count:,} 件）。"
     )
     st.info(
-        "テーマ分類は質問項目・親質問項目・質問詳細のキーワードを複数照合して行います。"
-        "同点で複数分野に該当する場合は『その他・要確認』に残します。"
-        "答弁担当部署の情報は現在の一般質問表に掲載されていないため、"
-        "現時点では部署による補正は未適用です。会議録から部署情報を取得できた場合に補助判定へ反映します。"
+        "分類は久留米市行政組織規則の各課の分掌事務に記載された業務内容を基準にしています。"
+        "質問文から所管課を推定し、対応する政策テーマに集約します。"
+        "『推定所管課』は質問文からの推定であり、実際に答弁した部署ではありません。"
+        "複数分野が同点、または対応語句がない場合は『その他・要確認』に残します。"
     )
     if fetch_errors:
         with st.expander(f"取得時の注意（{len(fetch_errors)}件）"):
             for item in fetch_errors:
                 st.write(f"- {item}")
 
-    t1, t2, t3, t4, t5 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(
         [
             "全体ダッシュボード",
             "議員別分析",
             "質問データ",
             "市民への影響",
             "情報発信・出典",
+            "質問・答弁を探す",
+            "会議録をまとめて読み込む",
         ]
     )
 
@@ -666,7 +786,7 @@ else:
             selected_questions = questions[questions["議員"] == selected_count_member].copy()
             st.markdown(f"**{selected_count_member} 議員の質問一覧（{len(selected_questions)}件）**")
             st.dataframe(
-                selected_questions[["年度", "会議", "質問項目", "テーマ（自動仮分類）", "分類根拠", "答弁担当部署", "公式資料URL"]],
+                selected_questions[["年度", "会議", "質問項目", "テーマ（自動仮分類）", "推定所管課（質問文から）", "分類根拠", "答弁担当部署", "公式資料URL"]],
                 use_container_width=True, hide_index=True,
                 column_config={"公式資料URL": st.column_config.LinkColumn("公式資料", display_text="資料を開く")},
             )
@@ -703,7 +823,7 @@ else:
             person[
                 [
                     "年度", "会議", "テーマ（自動仮分類）",
-                    "質問項目", "分類根拠", "答弁担当部署", "公式資料URL",
+                    "質問項目", "推定所管課（質問文から）", "分類根拠", "答弁担当部署", "公式資料URL",
                 ]
             ],
             use_container_width=True,
@@ -734,7 +854,7 @@ else:
 
     with t3:
         st.subheader("取得した一般質問データ")
-        st.caption("『分類根拠』で自動判定に使った語句を確認できます。『答弁担当部署』は会議録からの取得機能が未実装のため、現在は空欄です。")
+        st.caption("『推定所管課（質問文から）』は所掌事務キーワードによる推定です。実際の答弁部署とは異なる場合があります。『答弁担当部署』は会議録からの取得機能が未実装のため、現在は空欄です。")
         search = st.text_input("議員名・質問内容で検索")
         view = questions.copy()
         if search:
@@ -816,9 +936,134 @@ else:
             "会議録原本・公式公開資料との照合が必要です。"
         )
 
+    with t6:
+        st.subheader("質問に対する答弁を探す")
+        st.write(
+            "現任期の一般質問を選び、久留米市議会の会議録検索システムで "
+            "質問と答弁の記録を確認します。会議録検索システムの公開対象は平成19年5月以降です。"
+        )
+        st.warning(
+            "現在の検索システムは検索フォームとWord形式ダウンロードを提供していますが、 "
+            "外部システムの検索結果をアプリが自動取得できる仕様かは確認できていません。 "
+            "そのため、この初版では検索語を準備して公式検索画面を開く方式です。"
+        )
+        if questions.empty:
+            st.info("質問データがないため、質問を選択できません。")
+        else:
+            member_options = sorted(questions["議員"].dropna().unique().tolist())
+            chosen_member = st.selectbox("質問した議員", member_options, key="answer_search_member")
+            member_questions = questions[questions["議員"] == chosen_member].copy()
+            member_questions["選択表示"] = member_questions.apply(
+                lambda r: f"{r['年度']}年・{r['会議']}・{clean_text(r['質問項目'])[:70]}", axis=1
+            )
+            selected_label = st.selectbox(
+                "答弁を探したい質問", member_questions["選択表示"].tolist(),
+                key="answer_search_question",
+            )
+            selected_row = member_questions[member_questions["選択表示"] == selected_label].iloc[0]
+            st.markdown("**選択した質問項目**")
+            st.write(clean_text(selected_row["質問項目"]))
+            if clean_text(selected_row.get("質問詳細", "")):
+                st.caption(clean_text(selected_row["質問詳細"]))
+            st.caption(f"会議：{selected_row['会議']} ／ 質問者：{selected_row['議員']}")
+
+            suggested_terms = [
+                clean_text(selected_row.get("質問項目", "")),
+                clean_text(selected_row.get("親質問項目", "")),
+            ]
+            suggested_terms = [x for x in suggested_terms if x]
+            default_terms = " ".join(dict.fromkeys(suggested_terms))[:100]
+            search_terms = st.text_input(
+                "会議録検索に使う語句（必要に応じて短くしてください）",
+                value=default_terms,
+                key="answer_search_terms",
+            )
+            st.text_input(
+                "発言者（質問した議員）", value=chosen_member,
+                help="会議録検索画面の『発言者』欄に入力してください。",
+                key="answer_search_speaker",
+            )
+            st.markdown(
+                "**検索の手順**\n"
+                "1. 下のボタンで会議録検索画面を開く\n"
+                "2. 検索語を入力し、会議期間を質問の年度・会議に合わせる\n"
+                "3. 発言者を指定し、必要に応じて答弁者も選択する\n"
+                "4. 検索結果から該当する質問・答弁を開き、Word形式で保存する"
+            )
+            st.code(search_terms or "質問項目から検索語を入力してください", language=None)
+            st.link_button(
+                "久留米市議会 会議録検索を開く",
+                "https://www.kensakusystem.jp/kurume/cgi-bin3/Search2.exe?Code=k0yboqg35vrfmhbt6j&sTarget=2",
+                use_container_width=True,
+            )
+            st.link_button(
+                "会議録検索システムの操作説明",
+                "https://www.kensakusystem.jp/kurume/help/help_top.html",
+                use_container_width=True,
+            )
+            st.caption(
+                "検索結果の発言者・会議名・発言順を照合してから、質問と答弁を対応付けてください。"
+                "同じキーワードが含まれるだけでは、同じ質問への答弁とは限りません。"
+            )
+
+
+
+    with t7:
+        st.subheader("会議録をまとめて読み込む")
+        st.write(
+            "会議録検索システムからWord形式（.docx）で保存したファイルを、"
+            "複数まとめて選択できます。本文を抽出し、発言者ごとの発言ブロックに整理します。"
+        )
+        st.link_button("久留米市議会 会議録検索システムを開く", MINUTES_HOME, use_container_width=True)
+        st.caption(
+            "公式ヘルプで確認できるのは、検索・閲覧と表示中会議録のWordダウンロードです。"
+            "全期間一括取得や公開APIは確認できていないため、この機能は複数のWordファイルを"
+            "一度に取り込む方式です。"
+        )
+        uploaded_minutes = st.file_uploader(
+            "会議録のWordファイル（複数選択可）",
+            type=["docx"], accept_multiple_files=True, key="minutes_docx_upload",
+        )
+        if uploaded_minutes:
+            extracted_records = []
+            for file in uploaded_minutes:
+                try:
+                    full_text = extract_docx_text(file)
+                    turns = split_minutes_speakers(full_text)
+                    if not turns:
+                        turns = [{"発言者": "発言者未判定", "区分（推定）": "未判定", "発言内容": full_text}] if full_text else []
+                    for turn_no, turn in enumerate(turns, start=1):
+                        extracted_records.append({
+                            "ファイル名": file.name, "発言順": turn_no,
+                            "発言者": turn["発言者"], "区分（推定）": turn["区分（推定）"],
+                            "発言内容": turn["発言内容"],
+                        })
+                except Exception as exc:
+                    st.error(f"{file.name} を読み込めませんでした：{type(exc).__name__}: {exc}")
+            if extracted_records:
+                minutes_df = pd.DataFrame(extracted_records)
+                st.success(f"{len(uploaded_minutes)}ファイルから {len(minutes_df)} 発言ブロックを抽出しました。")
+                st.warning(
+                    "発言者・答弁側の判定は見出し表記に基づく暫定判定です。質問と答弁の対応関係を"
+                    "自動確定したものではありません。会議名・発言者・発言順を確認してください。"
+                )
+                speaker_filter = st.selectbox(
+                    "表示する区分", ["すべて", "質問・発言側候補", "答弁側候補", "未判定"],
+                    key="minutes_speaker_filter",
+                )
+                view_df = minutes_df if speaker_filter == "すべて" else minutes_df[minutes_df["区分（推定）"] == speaker_filter]
+                st.dataframe(view_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "抽出した発言一覧をCSVで保存",
+                    data=minutes_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="kurume_minutes_speeches.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+                st.session_state["minutes_imported_records"] = minutes_df
+
 st.divider()
 st.caption(
-    "分析上の注意：テーマ分類・文章指標は文字列に基づく参考情報です。"
+    "分析上の注意：テーマ分類は久留米市行政組織規則の分掌事務を基準にしたキーワード照合による参考情報です。"
     "質問の質、行政の対応、市民への成果を確定評価するものではありません。"
     "評価を公表する際は、発言全文・答弁・公式資料・対象者数の根拠を"
     "人が確認してください。"
